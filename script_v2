@@ -13,8 +13,14 @@ SOLR_INTERVAL=120
 
 mkdir -p "${LOG_DIR}"
 MASTER_LOG="${LOG_DIR}/migration_$(date +%Y%m%d_%H%M%S).log"
+KS_LOG=""
 
-log() { local line="[$(date '+%Y-%m-%d %H:%M:%S')] $*"; echo "${line}"; echo "${line}" >> "${MASTER_LOG}"; }
+log() {
+    local line="[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+    echo "${line}"
+    echo "${line}" >> "${MASTER_LOG}"
+    [[ -n "${KS_LOG}" ]] && echo "${line}" >> "${KS_LOG}"
+}
 
 format_duration() {
     local s=$1
@@ -59,6 +65,7 @@ wait_for_solr_idle() {
 migrate_keyspace() {
     local ks="$1"
     local start; start=$(date +%s)
+    KS_LOG="${LOG_DIR}/${ks}_$(date +%Y%m%d_%H%M%S).log"
 
     log "INFO  ===== START ${ks} [$(date '+%Y-%m-%d %H:%M:%S')] ====="
 
@@ -78,6 +85,7 @@ migrate_keyspace() {
     KS_DURATION["${ks}"]=$(format_duration $(( $(date +%s) - start )))
     KS_STATUS["${ks}"]="SUCCESS"
     log "INFO  ===== END ${ks}  duration=${KS_DURATION[${ks}]}  [$(date '+%Y-%m-%d %H:%M:%S')] ====="
+    KS_LOG=""
 }
 
 while getopts "f:h" opt; do
