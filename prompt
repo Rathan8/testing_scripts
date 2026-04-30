@@ -1,0 +1,31 @@
+I have two Ansible playbooks for Cassandra migration and I want a simple bash shell script to orchestrate them.
+
+Playbook 1 — data copy:
+ansible-playbook playbooks/dat_copy.yaml -i inventory/node.ini -e 'source=<hostname> target=<hostname> target_keyspace=<keyspace>' -u cassandra
+
+This copies SSTable data in parallel across nodes. It takes several minutes to hours per keyspace.
+
+Playbook 2 — nodetool import:
+ansible-playbook playbooks/nodetool_import.yaml -i inventory/node.ini -e 'target_keyspace=<keyspace> solr_check_only=true' -u cassandra
+
+When solr_check_only=true it checks if Solr indexing is still running.
+- Non-empty output = still indexing
+- Empty output = indexing done
+
+Sample output when indexing is still running:
+<paste your actual nodetool output here>
+
+Sample output when indexing is complete (idle):
+<paste your actual empty/idle output here>
+
+Requirements for the bash script:
+1. Read keyspaces from a file keyspaces.txt (one per line, skip # comments and blank lines)
+2. Process each keyspace sequentially — run copy → trigger import → poll until Solr idle → move to next
+3. Poll every 2 minutes, fail the keyspace if Solr is not idle after 3 hours
+4. Log to /var/log/cassandra_migration/ — one master log and one log file per keyspace
+5. Print start time, end time, and duration for each keyspace copy step and overall
+6. Print a summary table at the end (keyspace / status / duration)
+7. Safe to run in background with nohup
+8. Keep the script simple — no colours, minimal comments
+
+The grep pattern to detect active Solr indexing from the playbook output log should match: <describe what text appears in output when indexing is active>
