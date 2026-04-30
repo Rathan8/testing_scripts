@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+KEYSPACES_FILE="${KEYSPACES_FILE:-keyspaces.txt}"
+KEYSPACES=()
+
+COPY_CMD_TEMPLATE="ansible-playbook playbooks/dat_copy.yaml -i inventory/node.ini -e 'source=src-host target=tgt-host target_keyspace={keyspace}' -u cassandra"
+IMPORT_CMD_TEMPLATE="ansible-playbook playbooks/nodetool_import.yaml -i inventory/node.ini -e 'target_keyspace={keyspace}' -u cassandra"
+
+LOG_DIR="/var/log/cassandra_migration"
+SOLR_MAX_RETRIES=90    # 90 x 120s = 3 hours
+SOLR_INTERVAL=120
+
+mkdir -p "${LOG_DIR}"
+MASTER_LOG="${LOG_DIR}/migration_$(date +%Y%m%d_%H%M%S).log"
+
+log() { local line="[$(date '+%Y-%m-%d %H:%M:%S')] $*"; echo "${line}"; echo "${line}" >> "${MASTER_LOG}"; }
+
+format_duration() {
+    local s=$1
+    printf "%02dh %02dm %02ds" $(( s/3600 )) $(( (s%3600)/60 )) $(( s%60 ))
+}
+
+declare -A KS_STATUS KS_DURATION
+
+run_command() {
+    local cmd="${1//\{keyspace\}/$2}"
+    local out="${LOG_DIR}/$2_$3_$(date +%H%M%S).log"
+    if eval "${cmd}" > "${out}" 2>&1; then
+        return 0
+    else
+        log "ERROR [$3] failed for keyspace: $2 — see ${out}"
+        return 1
+    fi
+}
+
+wait_for_solr_idle() {
+    local ks="$1" attempt=0
+    log "INFO  Waiting for Solr idle: ${ks}"
+    while true; do
+        attempt=$(( attempt + 1 ))
+        if [[ ${attempt} -gt ${SOLR_MAX_RETRIES} ]]; then
+            log "ERROR Solr timed out after 3h: ${ks}"
+            return 1
+        fi
+        local out="${LOG_DIR}/${ks}_solr_${attempt}.log"
+        eval "${IMPORT_CMD_TEMPLATE//\{keyspace\}/${ks}} -e 'solr_check_only=true'" > "${out}" 2>&1 || true
+        local active
+        active=$(grep -cE "stdout.*[a-zA-Z]" "${out}" || true)
+        if [[ "${active}" -eq 0 ]]; then
+            log "INFO  Solr idle: ${ks}"
+            return 0
+        fi
+        log "INFO  Solr still indexing (attempt ${attempt}/${SOLR_MAX_RETRIES}) — next check in ${SOLR_INTERVAL}s ..."
+        sleep "${SOLR_INTERVAL}"
+    done
+}
+
+migrate_keyspace() {
+    local ks="$1"
+    local start; start=$(date +%s)
+
+    log "INFO  ===== START ${ks} [$(date '+%Y-%m-%d %H:%M:%S')] ====="
+
+    if ! run_command "${COPY_CMD_TEMPLATE}" "${ks}" "copy"; then
+        KS_STATUS["${ks}"]="FAILED(copy)"; KS_DURATION["${ks}"]=$(format_duration $(( $(date +%s) - start ))); return 1
+    fi
+    log "INFO  Copy done: ${ks}  duration=$(format_duration $(( $(date +%s) - start )))  end=$(date '+%Y-%m-%d %H:%M:%S')"
+
+    if ! run_command "${IMPORT_CMD_TEMPLATE}" "${ks}" "import"; then
+        KS_STATUS["${ks}"]="FAILED(import)"; KS_DURATION["${ks}"]=$(format_duration $(( $(date +%s) - start ))); return 1
+    fi
+
+    if ! wait_for_solr_idle "${ks}"; then
+        KS_STATUS["${ks}"]="FAILED(solr_timeout)"; KS_DURATION["${ks}"]=$(format_duration $(( $(date +%s) - start ))); return 1
+    fi
+
+    KS_DURATION["${ks}"]=$(format_duration $(( $(date +%s) - start )))
+    KS_STATUS["${ks}"]="SUCCESS"
+    log "INFO  ===== END ${ks}  duration=${KS_DURATION[${ks}]}  [$(date '+%Y-%m-%d %H:%M:%S')] ====="
+}
+
+while getopts "f:h" opt; do
+    case "${opt}" in
+        f) KEYSPACES_FILE="${OPTARG}" ;;
+        *) echo "Usage: $0 [-f keyspaces.txt]"; exit 0 ;;
+    esac
+done
+
+[[ ! -f "${KEYSPACES_FILE}" ]] && { log "ERROR Keyspaces file not found: ${KEYSPACES_FILE}"; exit 1; }
+
+while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line//[[:space:]]/}"
+    [[ -z "${line}" || "${line}" == \#* ]] && continue
+    KEYSPACES+=("${line}")
+done < "${KEYSPACES_FILE}"
+
+[[ ${#KEYSPACES[@]} -eq 0 ]] && { log "ERROR No keyspaces found in ${KEYSPACES_FILE}"; exit 1; }
+
+log "INFO  Keyspaces: ${KEYSPACES[*]}"
+log "INFO  Logs: ${LOG_DIR}"
+
+OVERALL_START=$(date +%s)
+FAILED=0
+
+for ks in "${KEYSPACES[@]}"; do
+    migrate_keyspace "${ks}" || FAILED=$(( FAILED + 1 ))
+done
+
+log "INFO  ===== MIGRATION COMPLETE  total=$(format_duration $(( $(date +%s) - OVERALL_START )))  failed=${FAILED} ====="
+
+printf "\n%-30s %-22s %-20s\n" "KEYSPACE" "STATUS" "DURATION"
+printf "%-30s %-22s %-20s\n" "------------------------------" "----------------------" "--------------------"
+for ks in "${KEYSPACES[@]}"; do
+    printf "%-30s %-22s %-20s\n" "${ks}" "${KS_STATUS[$ks]:-SKIPPED}" "${KS_DURATION[$ks]:-N/A}"
+done | tee -a "${MASTER_LOG}"
+
+[[ ${FAILED} -gt 0 ]] && exit 1
+exit 0
